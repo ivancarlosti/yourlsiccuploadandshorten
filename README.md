@@ -3,6 +3,10 @@ YOURLS Plugin: Upload and Shorten
 
 Plugin for [YOURLS](http://yourls.org) (version 1.7 or newer)
 
+<!-- buttons -->
+
+<!-- endbuttons -->
+
 Description
 -----------
 This plugin lets you upload a file to your webserver and automagically creates a YOURLS short-URL for it. Then you can share that file by its short link as well as its full URL.
