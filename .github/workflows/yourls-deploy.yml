@@ -1,0 +1,233 @@
+name: 🎯 YOURLS Plugin Deploy
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag to deploy (e.g., v1.2.3)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    name: 📦 Package & Publish YOURLS Plugin
+    runs-on: ubuntu-latest
+
+    steps:
+      # -------------------------------------------------------
+      # 1. Checkout the release tag
+      # -------------------------------------------------------
+      - name: 📥 Checkout at release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.version }}
+          fetch-depth: 0
+
+      # -------------------------------------------------------
+      # 2. Resolve the version and the plugin identity.
+      #     Nothing is hard coded: the plugin file, the plugin
+      #     name and the slug are read from the 'Plugin Name:'
+      #     header, so this workflow fits any YOURLS plugin.
+      #       plugin name -> slug (lowercase, hyphens), used both
+      #       as the zip file name and as the folder inside it
+      # -------------------------------------------------------
+      - name: 🏷️ Resolve version and plugin identity
+        id: identity
+        run: |
+          TAG="${{ github.event.release.tag_name || inputs.version }}"
+          VERSION="${TAG#v}"
+
+          # Main plugin file: prefer ./plugin.php, otherwise the shallowest
+          # .php file carrying a 'Plugin Name:' header.
+          PLUGIN_FILE=""
+          if [ -f plugin.php ] && grep -qE '^[[:space:]]*Plugin Name:' plugin.php; then
+            PLUGIN_FILE="plugin.php"
+          else
+            PLUGIN_FILE=$(grep -rlE '^[[:space:]]*Plugin Name:' --include='*.php' . 2>/dev/null \
+              | sed 's|^\./||' \
+              | grep -Ev '^(\.git|node_modules|vendor|tests)/' \
+              | awk '{ print length, $0 }' | sort -k1,1n | cut -d' ' -f2- | head -n 1 || true)
+          fi
+
+          if [ -z "${PLUGIN_FILE}" ]; then
+            echo "::error::No .php file with a 'Plugin Name:' header was found in the repository."
+            exit 1
+          fi
+
+          PLUGIN_NAME=$(sed -nE 's/^[[:space:]]*Plugin Name:[[:space:]]*(.*)$/\1/p' "${PLUGIN_FILE}" | head -n 1 | sed -E 's/[[:space:]]+$//')
+          if [ -z "${PLUGIN_NAME}" ]; then
+            echo "::error::Unable to read the 'Plugin Name:' header from ${PLUGIN_FILE}."
+            exit 1
+          fi
+
+          # 'ICC OpenID Connect Client' -> 'icc-openid-connect-client'
+          # (the slug is both the zip file name and the folder inside the zip)
+          SLUG=$(printf '%s' "${PLUGIN_NAME}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
+
+          if [ -z "${SLUG}" ]; then
+            echo "::error::Unable to derive a slug from the plugin name '${PLUGIN_NAME}'."
+            exit 1
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "plugin_name=${PLUGIN_NAME}" >> "$GITHUB_OUTPUT"
+          echo "plugin_file=${PLUGIN_FILE}" >> "$GITHUB_OUTPUT"
+          echo "slug=${SLUG}" >> "$GITHUB_OUTPUT"
+          echo "zip_name=${SLUG}.zip" >> "$GITHUB_OUTPUT"
+
+          echo "Plugin name ....: ${PLUGIN_NAME}"
+          echo "Plugin file ....: ${PLUGIN_FILE}"
+          echo "Package ........: ${SLUG}.zip -> ${SLUG}/plugin.php"
+          echo "Version ........: ${VERSION} (tag ${TAG})"
+
+      # -------------------------------------------------------
+      # 3. Stamp the release version into the files that are
+      #     shipped inside the zip: the plugin header, any
+      #     define( '<something>VERSION', 'x.y.z' ); and an
+      #     optional manifest.json.
+      # -------------------------------------------------------
+      - name: 🔢 Stamp release version
+        run: |
+          VERSION="${{ steps.identity.outputs.version }}"
+          PLUGIN_FILE="${{ steps.identity.outputs.plugin_file }}"
+
+          echo "Stamping version ${VERSION}..."
+
+          # 1. YOURLS plugin header: rewrite the first 'Version:' line.
+          sed -i -E "0,/^[[:space:]]*Version:/s/^[[:space:]]*Version:[[:space:]]*.*/Version: ${VERSION}/" "${PLUGIN_FILE}"
+          echo "  ✓ header ${PLUGIN_FILE}"
+
+          # 2. Any define( '<something>VERSION', 'x.y.z' ); in the plugin file.
+          if grep -Eq "define\(\s*'[A-Za-z0-9_]*VERSION'\s*,\s*'[^']*'\s*\)" "${PLUGIN_FILE}"; then
+            sed -i -E "s/(define\(\s*'[A-Za-z0-9_]*VERSION'\s*,\s*')[^']*(')/\1${VERSION}\2/" "${PLUGIN_FILE}"
+            echo "  ✓ version define ${PLUGIN_FILE}"
+          fi
+
+          # 3. manifest.json, when the plugin ships one.
+          if [ -f manifest.json ] && grep -qE '"version"[[:space:]]*:' manifest.json; then
+            sed -i -E "s/(\"version\"[[:space:]]*:[[:space:]]*\")[^\"]*(\")/\1${VERSION}\2/" manifest.json
+            echo "  ✓ manifest.json version"
+          fi
+
+          # 4. Fail when any stamped marker does not carry the release version.
+          FAIL=0
+
+          HV=$(sed -nE 's/^[[:space:]]*Version:[[:space:]]*(.*)$/\1/p' "${PLUGIN_FILE}" | head -n 1 | tr -d '[:space:]')
+          if [ -z "${HV}" ]; then
+            echo "::error::No 'Version:' header found in ${PLUGIN_FILE}."
+            FAIL=1
+          elif [ "${HV}" != "${VERSION}" ]; then
+            echo "::error::Header 'Version:' in ${PLUGIN_FILE} is '${HV}', expected '${VERSION}'."
+            FAIL=1
+          fi
+
+          if grep -Eq "define\(\s*'[A-Za-z0-9_]*VERSION'" "${PLUGIN_FILE}"; then
+            DV=$(sed -nE "s/.*define\(\s*'[A-Za-z0-9_]*VERSION'\s*,\s*'([^']*)'\s*\).*/\1/p" "${PLUGIN_FILE}" | head -n 1 | tr -d '[:space:]')
+            if [ "${DV}" != "${VERSION}" ]; then
+              echo "::error::Version define in ${PLUGIN_FILE} is '${DV}', expected '${VERSION}'."
+              FAIL=1
+            fi
+          fi
+
+          if [ -f manifest.json ] && grep -qE '"version"[[:space:]]*:' manifest.json; then
+            MV=$(sed -nE 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' manifest.json | head -n 1 | tr -d '[:space:]')
+            if [ "${MV}" != "${VERSION}" ]; then
+              echo "::error::manifest.json version is '${MV}', expected '${VERSION}'."
+              FAIL=1
+            fi
+          fi
+
+          [ "${FAIL}" -eq 0 ] || exit 1
+
+          echo "✅ Version ${VERSION} stamped successfully."
+
+      # -------------------------------------------------------
+      # 4. Create the YOURLS plugin zip.
+      #     YOURLS loads user/plugins/<folder>/plugin.php, so the
+      #     archive root folder is the hyphenated plugin name and
+      #     the main file always ships as plugin.php.
+      # -------------------------------------------------------
+      - name: 📦 Create YOURLS plugin ZIP
+        run: |
+          SLUG="${{ steps.identity.outputs.slug }}"
+          ZIP_NAME="${{ steps.identity.outputs.zip_name }}"
+          PLUGIN_FILE="${{ steps.identity.outputs.plugin_file }}"
+          BUILD_ROOT="/tmp/yourls-build"
+          BUILD_DIR="${BUILD_ROOT}/${SLUG}"
+
+          rm -rf "${BUILD_ROOT}"
+          mkdir -p "${BUILD_DIR}"
+
+          # Copy the plugin, leaving development only files behind.
+          rsync -av . "${BUILD_DIR}/" \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.gitignore' \
+            --exclude='.gitattributes' \
+            --exclude='.editorconfig' \
+            --exclude='.dockerignore' \
+            --exclude='.releaserc' \
+            --exclude='.vscode' \
+            --exclude='.idea' \
+            --exclude='node_modules' \
+            --exclude='tests' \
+            --exclude='docker' \
+            --exclude='Dockerfile' \
+            --exclude='CNAME' \
+            --exclude='README.md' \
+            --exclude='LICENSE' \
+            --exclude='*.zip'
+
+          # YOURLS only loads <folder>/plugin.php.
+          if [ "${PLUGIN_FILE}" != "plugin.php" ]; then
+            echo "Renaming ${PLUGIN_FILE} to plugin.php (required by YOURLS)."
+            mv "${BUILD_DIR}/${PLUGIN_FILE}" "${BUILD_DIR}/plugin.php"
+          fi
+
+          # The zip file name and its root folder are the same slug.
+          cd "${BUILD_ROOT}"
+          rm -f "${GITHUB_WORKSPACE}/${ZIP_NAME}"
+          zip -r "${GITHUB_WORKSPACE}/${ZIP_NAME}" "${SLUG}/"
+
+          echo "YOURLS package created: ${ZIP_NAME}"
+          unzip -l "${GITHUB_WORKSPACE}/${ZIP_NAME}"
+
+          # Sanity checks: plugin.php is present and carries the release version.
+          if ! unzip -l "${GITHUB_WORKSPACE}/${ZIP_NAME}" | grep -q "${SLUG}/plugin.php"; then
+            echo "::error::${ZIP_NAME} does not contain ${SLUG}/plugin.php."
+            exit 1
+          fi
+
+          ZV=$(unzip -p "${GITHUB_WORKSPACE}/${ZIP_NAME}" "${SLUG}/plugin.php" | sed -nE 's/^[[:space:]]*Version:[[:space:]]*(.*)$/\1/p' | head -n 1 | tr -d '[:space:]')
+          if [ "${ZV}" != "${{ steps.identity.outputs.version }}" ]; then
+            echo "::error::Packaged plugin.php has version '${ZV}', expected '${{ steps.identity.outputs.version }}'."
+            exit 1
+          fi
+
+          # No development path may leak into the package.
+          for forbidden in tests .github docker README.md LICENSE .git; do
+            if unzip -l "${GITHUB_WORKSPACE}/${ZIP_NAME}" | grep -q "${SLUG}/${forbidden}"; then
+              echo "::error::Development path '${forbidden}' leaked into ${ZIP_NAME}."
+              exit 1
+            fi
+          done
+
+          echo "✅ ${ZIP_NAME} is ready (version ${ZV})."
+
+      # -------------------------------------------------------
+      # 5. Upload the package to the GitHub Release
+      # -------------------------------------------------------
+      - name: 📤 Upload YOURLS plugin ZIP to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ steps.identity.outputs.tag }}" \
+            "${{ steps.identity.outputs.zip_name }}" --clobber
+
+          echo "YOURLS plugin ZIP uploaded to release ${{ steps.identity.outputs.tag }}"

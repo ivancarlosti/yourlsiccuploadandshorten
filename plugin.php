@@ -1,11 +1,11 @@
 <?php
 /*
 Plugin Name: ICC Upload & Shorten
-Plugin URI: https://github.com/ivancarlosti/YOURLS-Upload-and-Shorten
+Plugin URI: https://github.com/ivancarlosti/yourlsiccuploadandshorten
 Description: Upload a file locally or to AWS S3 and create a short-YOURL for it in one step.
-Version: 1.0
+Version: 1.0.0
 Author: Ivan Carlos
-Author URI: https://github.com/ivancarlosti
+Author URI: https://ivancarlos.com.br/
 */
 
 // No direct call
