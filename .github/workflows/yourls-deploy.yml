@@ -23,7 +23,7 @@ jobs:
       # 1. Checkout the release tag
       # -------------------------------------------------------
       - name: 📥 Checkout at release tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.release.tag_name || inputs.version }}
           fetch-depth: 0
